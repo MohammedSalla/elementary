@@ -186,93 +186,56 @@
 
 {%- macro clickhouse__get_test_results(days_back = 7, invocations_per_test = 720, disable_passed_test_metrics = false, skip_test_result_rows = false) -%}
     {% set elementary_tests_allowlist_status = ['fail', 'warn'] if disable_passed_test_metrics else ['fail', 'warn', 'pass']  %}
-    {% do elementary.run_query('drop table if exists ordered_test_results') %}
-    {% set create_table_query %}
-    CREATE TABLE ordered_test_results (
-        id String,
-        invocation_id String,
-        test_execution_id String,
-        model_unique_id String,
-        test_unique_id String,
-        elementary_unique_id String,
-        detected_at DateTime,
-        database_name String,
-        schema_name String,
-        table_name String,
-        column_name String,
-        test_type String,
-        test_sub_type String,
-        test_results_description String,
-        test_description String,
-        original_path String,
-        package_name String,
-        owners String,
-        model_owner String,
-        tags String,
-        test_tags String,
-        model_tags String,
-        meta String,
-        model_meta String,
-        test_results_query String,
-        other String,
-        test_name String,
-        test_params String,
-        severity String,
-        status String,
-        execution_time Float64,
-        days_diff Int32,
-        invocations_rank_index UInt32,
-        failures Int64,
-        result_rows String
-    )
-    ENGINE = MergeTree()
-    ORDER BY (elementary_unique_id, invocations_rank_index);
-    {% endset %}
-    {% do elementary.run_query(create_table_query) %}
-    {% set insert_query %}
-    INSERT INTO ordered_test_results
+    {#
+        Read through a subquery instead of staging rows in a scratch table: on a multi-replica
+        cluster, a plain MergeTree table only has the rows on the replica that ran the INSERT,
+        so a read routed to another replica returned no test results.
+        Every column is aliased because ClickHouse keeps the table prefix (e.g. `etr.status`)
+        on a column whose name also exists in a joined table.
+    #}
+    {% set ordered_test_results_query %}
     SELECT
-        etr.id,
-        etr.invocation_id,
-        etr.test_execution_id,
-        etr.model_unique_id,
-        etr.test_unique_id,
+        etr.id AS id,
+        etr.invocation_id AS invocation_id,
+        etr.test_execution_id AS test_execution_id,
+        etr.model_unique_id AS model_unique_id,
+        etr.test_unique_id AS test_unique_id,
         CASE
             WHEN etr.test_type = 'schema_change' THEN etr.test_unique_id
             WHEN dt.short_name = 'dimension_anomalies' THEN etr.test_unique_id
             ELSE {{ dbt.concat(["coalesce(etr.test_unique_id, 'None')", "'.'", "coalesce(nullif(etr.column_name, ''), 'None')", "'.'", "coalesce(etr.test_sub_type, 'None')"]) }}
         END AS elementary_unique_id,
-        etr.detected_at,
-        etr.database_name,
-        etr.schema_name,
-        etr.table_name,
-        etr.column_name,
-        etr.test_type,
-        etr.test_sub_type,
-        etr.test_results_description,
+        etr.detected_at AS detected_at,
+        etr.database_name AS database_name,
+        etr.schema_name AS schema_name,
+        etr.table_name AS table_name,
+        etr.column_name AS column_name,
+        etr.test_type AS test_type,
+        etr.test_sub_type AS test_sub_type,
+        etr.test_results_description AS test_results_description,
         dt.description AS test_description,
-        dt.original_path,
-        dt.package_name,
-        etr.owners,
+        dt.original_path AS original_path,
+        dt.package_name AS package_name,
+        etr.owners AS owners,
         da.owner AS model_owner,
-        etr.tags,
+        etr.tags AS tags,
         dt.tags AS test_tags,
         da.tags AS model_tags,
-        dt.meta,
+        dt.meta AS meta,
         da.meta AS model_meta,
-        etr.test_results_query,
-        etr.other,
+        etr.test_results_query AS test_results_query,
+        etr.other AS other,
         CASE
             WHEN dt.short_name IS NOT NULL THEN dt.short_name
             ELSE etr.test_name
         END AS test_name,
-        etr.test_params,
-        etr.severity,
-        etr.status,
-        drr.execution_time,
+        etr.test_params AS test_params,
+        etr.severity AS severity,
+        etr.status AS status,
+        drr.execution_time AS execution_time,
         {{ elementary.edr_datediff(elementary.edr_cast_as_timestamp('etr.detected_at'), elementary.edr_current_timestamp(), 'day') }} AS days_diff,
         ROW_NUMBER() OVER (PARTITION BY elementary_unique_id ORDER BY etr.detected_at DESC) AS invocations_rank_index,
-        etr.failures,
+        etr.failures AS failures,
         {% if skip_test_result_rows %}''{% else %}etr.result_rows{% endif %} AS result_rows
     FROM {{ ref('elementary', 'elementary_test_results') }} etr
     JOIN {{ ref('elementary', 'dbt_tests') }} dt ON etr.test_unique_id = dt.unique_id
@@ -291,24 +254,17 @@
     LEFT JOIN {{ ref('elementary', 'dbt_run_results') }} drr ON etr.test_execution_id = drr.model_execution_id
     WHERE {{ elementary.edr_datediff(elementary.edr_cast_as_timestamp('etr.detected_at'), elementary.edr_current_timestamp(), 'day') }} < {{ days_back }}
     {% endset %}
-    {% do elementary.run_query(insert_query) %}
-    {% set elementary_database, elementary_schema = elementary.get_package_database_and_schema() %}
-    {% set ordered_test_results_relation = api.Relation.create(
-        database=elementary_database,
-        schema=elementary_schema,
-        identifier='ordered_test_results',
-        type='table'
-    ) %}
 
     {% set test_results = [] %}
 
     {% set test_results_agate_sql %}
-        select * from {{ ordered_test_results_relation }}
+        select * from ({{ ordered_test_results_query }}) as ordered_test_results
+        order by elementary_unique_id, invocations_rank_index desc
     {% endset %}
 
     {% set valid_ids_query %}
         select distinct id
-        from {{ ordered_test_results_relation }}
+        from ({{ ordered_test_results_query }}) as ordered_test_results
         where invocations_rank_index = 1
     {% endset %}
 
@@ -317,9 +273,6 @@
         {% set test_result_rows_agate = elementary_cli.get_result_rows_agate(days_back, valid_ids_query) %}
     {% else %}
         {% set test_result_rows_agate = {} %}
-    {% endif %}
-    {% if not elementary.has_temp_table_support() %}
-        {% do elementary.fully_drop_relation(ordered_test_results_relation) %}
     {% endif %}
 
     {% do return(elementary_cli._process_raw_test_results(test_results_agate, test_result_rows_agate, elementary_tests_allowlist_status, skip_test_result_rows)) %}
